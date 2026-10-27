@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Explicit offline repair of only the current Atomic Memory projection."""
+"""Offline current-projection repair and verification of retained Atomic history."""
 
 from __future__ import annotations
 
@@ -26,12 +26,14 @@ from sqlalchemy import and_, exists, func, inspect, select, tuple_
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from powercontext.artifacts import ArtifactRef
 from powercontext.builtin.artifacts.atomic_memory.models import AtomicMemory, AtomicMemoryRecord, AtomicMemoryStateValue
 from powercontext.builtin.artifacts.memory.canonical import canonical_json
 from powercontext.builtin.artifacts.search import analyze_text
 from powercontext.builtin.inference import EmbeddingModel
 from powercontext.builtin.persistence.artifacts import ArtifactRepository
 from powercontext.builtin.persistence.atomic_memory import AtomicMemoryStateRepository
+from powercontext.builtin.persistence.atomic_memory_evidence import AtomicMemoryEvidenceRepository
 from powercontext.builtin.persistence.atomic_memory_index import (
     AtomicMemoryIndex,
     AtomicMemoryIndexError,
@@ -50,6 +52,7 @@ from powercontext.builtin.persistence.atomic_memory_readiness import (
 from powercontext.builtin.persistence.database import AsyncDatabase
 from powercontext.builtin.persistence.oceanbase.atomic_memory_index import OceanBaseAtomicMemoryIndex
 from powercontext.builtin.persistence.revision_metadata_schema import ensure_artifact_revision_metadata_schema
+from powercontext.builtin.persistence.sources import SourceRepository
 from powercontext.builtin.persistence.tables import ARTIFACT_HEADS_TABLE, ARTIFACTS_TABLE
 
 
@@ -60,7 +63,7 @@ class AtomicMemoryProjectionRebuildReport(BaseModel):
     errors: tuple[str, ...] = ()
 
 
-async def _require_authority(connection: AsyncConnection) -> None:
+async def _require_authority(connection: AsyncConnection, *, require_evidence: bool = True) -> None:
     await ensure_supported_atomic_memory_schema(connection)
     tables = set(await connection.run_sync(lambda sync: inspect(sync).get_table_names()))
     required = {
@@ -75,7 +78,7 @@ async def _require_authority(connection: AsyncConnection) -> None:
         raise AtomicMemoryIndexError(
             "authority-schema", "Atomic Memory authority is absent; complete initialization and history migration first"
         )
-    issues = await atomic_memory_readiness_issues(connection, tables)
+    issues = await atomic_memory_readiness_issues(connection, tables, require_evidence=require_evidence)
     if issues:
         raise AtomicMemoryIndexError("migration-pending", "Atomic Memory migration is not ready: " + "; ".join(issues))
     heads = ARTIFACT_HEADS_TABLE
@@ -114,6 +117,42 @@ async def _identity_batch(
         statement = statement.where(tuple_(heads.c.scope_id, heads.c.artifact_id) > after)
     rows = (await connection.execute(statement.order_by(heads.c.scope_id, heads.c.artifact_id).limit(batch_size))).all()
     return tuple((str(row.scope_id), str(row.artifact_id)) for row in rows)
+
+
+async def _verify_history(
+    connection: AsyncConnection, artifacts: ArtifactRepository, batch_size: int, sources: SourceRepository | None
+) -> dict[str, int]:
+    table = ARTIFACTS_TABLE
+    evidence = AtomicMemoryEvidenceRepository()
+    after: tuple[str, str, int] | None = None
+    revisions = neutral_sources = 0
+    while True:
+        statement = select(table.c.scope_id, table.c.artifact_id, table.c.revision).where(
+            table.c.family == AtomicMemory.family
+        )
+        if after is not None:
+            statement = statement.where(tuple_(table.c.scope_id, table.c.artifact_id, table.c.revision) > after)
+        rows = (
+            await connection.execute(
+                statement.order_by(table.c.scope_id, table.c.artifact_id, table.c.revision).limit(batch_size)
+            )
+        ).all()
+        if not rows:
+            break
+        for row in rows:
+            scope_id, artifact_id, revision = str(row.scope_id), str(row.artifact_id), int(row.revision)
+            reference = ArtifactRef(family=AtomicMemory.family, artifact_id=artifact_id, revision=revision)
+            artifact = await artifacts.get(connection, scope_id, reference)
+            annotation = await evidence.verify(
+                connection, scope_id, reference, artifact.lineage.sources, sources=sources
+            )
+            revisions += 1
+            neutral_sources += sum(
+                source.declaration.authority == "untrusted" and source.declaration.verification == "unknown"
+                for source in annotation.sources
+            )
+            after = scope_id, artifact_id, revision
+    return {"historical_revisions": revisions, "neutral_sources": neutral_sources}
 
 
 async def _record(
@@ -183,16 +222,26 @@ async def _projection_differences(
 
 
 async def verify_atomic_memory_current(
-    connection: AsyncConnection, index: AtomicMemoryIndex, /, *, batch_size: int = 100
+    connection: AsyncConnection,
+    index: AtomicMemoryIndex,
+    /,
+    *,
+    batch_size: int = 100,
+    sources: SourceRepository | None = None,
+    require_evidence: bool = True,
 ) -> AtomicMemoryProjectionRebuildReport:
-    """Check current identities without taking business row locks.
+    """Check current projections and every exact revision's retained evidence without taking business row locks.
 
     The caller owns a consistent read snapshot or an exclusive maintenance
-    transaction, including for identities created after migration.
+    transaction, including for identities created after migration. ``require_evidence``
+    is false only while an upgrade has not yet created the evidence tables.
     """
 
-    await _require_authority(connection)
+    if isinstance(batch_size, bool) or not 1 <= batch_size <= 1000:
+        raise AtomicMemoryIndexError("batch-size", "Projection rebuild batch size must be between 1 and 1000")
+    await _require_authority(connection, require_evidence=require_evidence)
     artifacts = ArtifactRepository((AtomicMemory,))
+    history_counts = await _verify_history(connection, artifacts, batch_size, sources) if require_evidence else {}
     profile = index.capabilities.embedding_profile
     fingerprint = None if profile is None else atomic_memory_profile_fingerprint(profile)
     errors: list[str] = []
@@ -230,7 +279,7 @@ async def verify_atomic_memory_current(
     return AtomicMemoryProjectionRebuildReport(
         ready=not errors,
         profile_fingerprint=fingerprint,
-        counts={"active_rows": active, "obsolete_rows": obsolete},
+        counts={"active_rows": active, "obsolete_rows": obsolete, **history_counts},
         errors=tuple(errors),
     )
 
@@ -285,6 +334,7 @@ async def rebuild_atomic_memory_projection(
     maintenance_confirmed: bool,
     embedding_model: EmbeddingModel | None = None,
     batch_size: int = 100,
+    sources: SourceRepository | None = None,
 ) -> AtomicMemoryProjectionRebuildReport:
     """Repair current without changing revisions, Family state or retained history.
 
@@ -353,7 +403,7 @@ async def rebuild_atomic_memory_projection(
         )
         await connection.execute(index.table.delete().where(_obsolete_current(index)))
         removed += obsolete
-        report = await verify_atomic_memory_current(connection, index, batch_size=batch_size)
+        report = await verify_atomic_memory_current(connection, index, batch_size=batch_size, sources=sources)
     return report.model_copy(
         update={
             "counts": {
